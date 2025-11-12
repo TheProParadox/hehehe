@@ -28,6 +28,17 @@ except ImportError:
     SAM_AVAILABLE = False
     print("[yellow]⚠️  SAM not available. Install: pip install transformers[/yellow]")
 
+def adjust_half_scores(aj_scores):
+    """
+    Reduce AJ scores in the second half while keeping the first half as is.
+    """
+    T = aj_scores.shape[0]
+    first_half = slice(0, T // 2)
+    second_half = slice(T // 2, T)
+
+    aj_scores[second_half] *= 0.7
+    return aj_scores
+
 
 def compute_aj_scores(coords_3d, visibs, conf_pred):
     T, N = coords_3d.shape[:2]
@@ -53,14 +64,17 @@ def compute_aj_scores(coords_3d, visibs, conf_pred):
     conf_normalized = np.clip(conf_pred, 0.0, 1.0)
     aj_scores = aj_scores * (0.7 + 0.3 * conf_normalized)
     aj_scores = np.clip(aj_scores, 0.1, 1.0)
+    aj_scores = adjust_half_scores(aj_scores)
+
     return aj_scores
 
 
 def score_to_color(score, vmin=0.0, vmax=1.0):
+    """Blue = good (high score), Red = bad (low score)"""
     normalized = np.clip((score - vmin) / (vmax - vmin + 1e-8), 0, 1)
-    b = int(255 * (1.0 - normalized))
+    b = int(255 * normalized)        # Blue increases with score
     g = 0
-    r = int(255 * normalized)
+    r = int(255 * (1.0 - normalized))  # Red decreases with score
     return (b, g, r)
 
 
@@ -92,13 +106,23 @@ def create_score_colored_video(
                 continue
             current_score = scores[t, n]
             color = score_to_color(current_score)
+            
+            # Draw trajectory tail with fading
             start_idx = max(0, t - trace_length)
             for tt in range(start_idx, t):
                 if not visibility[tt, n] or not visibility[tt + 1, n]:
                     continue
                 pt1 = (int(tracks_2d[tt, n, 0]), int(tracks_2d[tt, n, 1]))
                 pt2 = (int(tracks_2d[tt + 1, n, 0]), int(tracks_2d[tt + 1, n, 1]))
-                cv2.line(frame, pt1, pt2, color, line_thickness)
+                
+                # Fade older parts
+                age_factor = (tt - start_idx) / max(1, trace_length)
+                alpha = 0.3 + 0.7 * age_factor
+                overlay = frame.copy()
+                cv2.line(overlay, pt1, pt2, color, line_thickness)
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            
+            # Draw current point
             pt = (int(tracks_2d[t, n, 0]), int(tracks_2d[t, n, 1]))
             cv2.circle(frame, pt, point_radius, color, -1)
             cv2.circle(frame, pt, point_radius + 1, (255, 255, 255), 1)
@@ -164,7 +188,23 @@ if __name__ == "__main__":
     depth_tensor = depth_map.squeeze().cpu().numpy()
     extrs = extrinsic.squeeze().cpu().numpy()
     intrs = intrinsic.squeeze().cpu().numpy()
+    video_tensor = video_tensor_preprocessed.squeeze()
+    unc_metric = depth_conf.squeeze().cpu().numpy() > 0.5
     print(f"[green]✅ Depth and poses computed[/green]")
+
+    # Get query points - either from file or use default
+    if args.points_file and os.path.exists(args.points_file):
+        print(f"\n[bold cyan]Loading points from {args.points_file}...[/bold cyan]")
+        xy_points = np.loadtxt(args.points_file, dtype=int)
+        if xy_points.ndim == 1:
+            xy_points = xy_points.reshape(1, -1)
+        print(f"[green]✅ Loaded {len(xy_points)} points[/green]")
+        grid_pts = torch.from_numpy(xy_points).float().unsqueeze(0)
+        query_xyt = torch.cat([torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2)[0].numpy()
+    else:
+        # Default: let model auto-generate points
+        query_xyt = None
+        print("[yellow]⚠️  No points file provided, using model's default point generation[/yellow]")
 
     print(f"\n[bold cyan]Loading SpaTrack ({args.track_mode} mode)...[/bold cyan]")
     if args.track_mode == "offline":
@@ -182,24 +222,32 @@ if __name__ == "__main__":
             track3d_pred, track2d_pred, vis_pred, conf_pred, video
         ) = model.forward(video_tensor, depth=depth_tensor,
                           intrs=intrs, extrs=extrs,
-                          queries=None, fps=1, full_point=False,
+                          queries=query_xyt, fps=1, full_point=False,
                           iters_track=4, query_no_BA=True,
                           fixed_cam=False, stage=1,
-                          unc_metric=(depth_conf > 0.5),
+                          unc_metric=unc_metric,
                           support_frame=len(video_tensor)-1,
                           replace_ratio=0.2)
 
-        # ✅ FIX 4: correct resizing per-frame (avoid distortion)
+        # Resize if needed
         max_size = 336
         h, w = video.shape[2:]
         scale = min(max_size / h, max_size / w)
         if scale < 1:
             new_h, new_w = int(h * scale), int(w * scale)
             resize_fn = T.Resize((new_h, new_w))
+            
+            # Resize 4D tensors [T, C, H, W]
             video = torch.stack([resize_fn(f) for f in video])
-            video_tensor = torch.stack([zesize_fn(f) for f in video_tensor])
+            video_tensor = torch.stack([resize_fn(f) for f in video_tensor])
             point_map = torch.stack([resize_fn(f) for f in point_map])
-            conf_depth = torch.stack([resize_fn(f) for f in conf_depth])
+            
+            # Resize conf_depth - handle both [T, H, W] and [T, C, H, W] shapes
+            if conf_depth.ndim == 3:  # [T, H, W]
+                conf_depth = torch.stack([resize_fn(f.unsqueeze(0)).squeeze(0) for f in conf_depth])
+            else:  # [T, C, H, W]
+                conf_depth = torch.stack([resize_fn(f) for f in conf_depth])
+            
             track2d_pred[..., :2] *= scale
             intrs_out[:, :2, :] *= scale
 
@@ -217,6 +265,28 @@ if __name__ == "__main__":
 
         out_path = str(output_dir / "ball_tracking_pred_track.mp4")
         create_score_colored_video(video_rgb, tracks_2d_np, vis_np, aj_scores,
-                                   fps=args.output_fps, output_path=out_path)
+                                   fps=args.output_fps, output_path=out_path,
+                                   trace_length=5, point_radius=4, line_thickness=2)
+
+        # Save results to NPZ
+        print("[cyan]Saving results to NPZ...[/cyan]")
+        data_save = {}
+        data_save["coords"] = coords_3d_world
+        data_save["extrinsics"] = torch.inverse(c2w_traj).cpu().numpy()
+        data_save["intrinsics"] = intrs_out.cpu().numpy()
+        depth_save = point_map[:, 2, ...]
+        depth_save[conf_depth < 0.5] = 0
+        data_save["depths"] = depth_save.cpu().numpy()
+        data_save["video"] = video_tensor.cpu().numpy()
+        data_save["visibs"] = vis_pred.cpu().numpy()
+        data_save["unc_metric"] = conf_depth.cpu().numpy()
+        data_save["coords_score"] = aj_scores
+        
+        if args.points_file and os.path.exists(args.points_file):
+            data_save["ball_query_points"] = xy_points
+        
+        output_path = output_dir / 'result_ball_only.npz'
+        np.savez(str(output_path), **data_save)
 
         print(f"[green]✅ Output video saved: {out_path}[/green]")
+        print(f"[green]✅ NPZ file saved: {output_path}[/green]")
